@@ -11,20 +11,25 @@ import sys
 import tempfile
 
 # Checks / fixes every lib in a vendor-PLATFORM.tar.gz archive according to the following rules.
-# This includes the libraries that are currently embedded inside wheels
-# - check_for_unsatisfied_deps:
-#   All library deps must be contained in vendor-PLATFORM.tar.gz unless they are on the UNSATISFIED_DEPS_ALLOW_LIST.
-# - check_ids:
-#   All libraries must have IDs that are simply their own filename - not any other kind of path - or no ID at all.
-# - check_rpaths:
+# This includes the libraries that are currently embedded inside wheels.
+#
+# - fix_names(work_dir, **kwargs)
+#   All libraries must have install-names that are simply their own filename - not any other kind of path - or no install name at all.
+#
+# - fix_rpaths:
 #   (Note that @loader_path on Darwin and $ORIGIN on Linux expand to the directory of the binary or shared object doing
 #   the loading - they are both referred to as LOADER_PATH for convenience.)
 #   All libraries must have an RPATH of LOADER_PATH to ensure they can find deps in the same folder.
 #   All libraries that are not / will not be in env/lib must also have an RPATH of LOADER_PATH/<path-to-env-lib>,
 #   using the library's eventual install location for libraries that are currently inside wheels.
-# - check_dep_paths:
-#   All deps from one library inside the archive to another library inside the archive must be specified in
-#   the following way: @rpath/<name-of-library>. Deps to a library outside the archive are left unchanged.
+#
+# - fix_deps:
+#   All deps must be contained in the archive unless they are on the UNSATISFIED_DEPS_ALLOW_LIST.
+#   All deps must be named for the actual library that they need to find, not a symlink to it.
+#   All deps from one library inside the archive to another library inside the archive must be specified in the following way:
+#     * On Darwin: @rpath/<name-of-library>
+#     * On Linux: simply <name-of-library>
+#   Deps to libraries not contained in the archive are left unchanged.
 
 
 USAGE = """
@@ -229,26 +234,6 @@ UNMODIFIED = 0
 MODIFIED = 1
 
 
-def fix_symlinks(root_path, make_fatal=False, verbose=False):
-    symlinks = list(lib_paths(root_path, is_symlink=True))
-    # DONOTSUBMIT
-    symlinks = []
-    if not symlinks:
-        checkmark("Checking symlinks: no symlinks to remove.")
-        return UNMODIFIED
-
-    detail = json_dumps(symlinks, root_path) if verbose else None
-    warn(
-        f"Checking symlinks: found {len(symlinks)} to remove.",
-        make_fatal=make_fatal,
-        detail=detail,
-    )
-
-    for symlink in symlinks:
-        symlink.unlink()
-    return MODIFIED
-
-
 get_install_name = PlatformSpecific()
 
 
@@ -280,38 +265,7 @@ VERSION_PATTERN = re.compile("(" + DOT_PLUS_DIGITS + ")*$")
 
 
 def get_proposed_name(path_to_lib, install_name, root_path):
-    names = [path_to_lib.name]
-    if install_name:
-        names.append(Path(install_name).name)
-
-    # Remove the extension, temporarily...
-    common_ext = ""
-    for ext in LIB_EXTENSIONS:
-        if all(n.endswith(ext) for n in names):
-            common_ext = ext
-
-    if common_ext:
-        names_without_ext = [n[: -len(common_ext)] for n in names]
-    else:
-        names_without_ext = names
-
-    # Make sure all the names are variations on the same theme:
-    for n1 in names_without_ext:
-        for n2 in names_without_ext:
-            if not n1.startswith(n2) and not n2.startswith(n1):
-                path_to_lib = os.path.relpath(path_to_lib, root_path)
-                detail = json.dumps(list(names), indent=2)
-                fatal(f"Can't decide on name for {path_to_lib}:\n{detail}")
-
-    # TODO - not sure what to do here...
-    # Use only the major version if there are minor version numbers too.
-    longest_name = max(names_without_ext, key=len)
-    match = VERSION_PATTERN.search(longest_name)
-    if match:
-        return longest_name[: match.span()[0]] + common_ext
-
-    assert longest_name
-    return longest_name + common_ext
+    return path_to_lib.name
 
 
 def fix_names(root_path, make_fatal=False, verbose=False):
@@ -598,7 +552,6 @@ def fix_everything(input_path, output_path):
         unpack_all(input_path, work_dir)
 
         status = UNMODIFIED
-        status |= fix_symlinks(work_dir)
         status |= fix_names(work_dir)
         status |= fix_rpaths(work_dir)
         status |= fix_deps(work_dir)
@@ -607,7 +560,6 @@ def fix_everything(input_path, output_path):
             checkmark("Finished fixing.\n")
             info("Checking everything was fixed ...")
             kwargs = {"make_fatal": True, "verbose": True}
-            fix_symlinks(work_dir, **kwargs)
             fix_names(work_dir, **kwargs)
             fix_rpaths(work_dir, **kwargs)
             fix_deps(work_dir, **kwargs)
