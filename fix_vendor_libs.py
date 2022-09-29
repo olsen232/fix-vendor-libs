@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from enum import Enum
 import json
 import os
 from pathlib import Path
@@ -12,8 +13,23 @@ import tempfile
 
 # Checks / fixes every lib in a vendor-PLATFORM.tar.gz archive according to the following rules.
 # This includes the libraries that are currently embedded inside wheels.
+
+# Glossary:
+# A system dep is a dependency that we expect to be installed on the target system such as "libstdc++.so"
+# Other dependencies are vendor deps - these ones we must bundle in the vendor archive.
 #
-# - fix_names(work_dir, **kwargs)
+# - fix_unsatisfied_deps:
+#   All vendor deps must be contained in the vendor-archive. Vendor deps that are outside the archive but which can be
+#   found on the filesystem will be copied into the right place.
+#   All system deps must be explicitly allowed on the SYSTEM_DEPS_ALLOW_LIST.
+#
+# - fix_dep_linkage:
+#   All vendor deps must be specified in the following manner.
+#     * On Darwin: @rpath/<name-of-library>
+#     * On Linux: simply <name-of-library>
+#   Deps to libraries not contained in the archive are left unchanged.
+#
+# - fix_names:
 #   All libraries must have install-names that are simply their own filename - not any other kind of path - or no install name at all.
 #
 # - fix_rpaths:
@@ -23,13 +39,6 @@ import tempfile
 #   All libraries that are not / will not be in env/lib must also have an RPATH of LOADER_PATH/<path-to-env-lib>,
 #   using the library's eventual install location for libraries that are currently inside wheels.
 #
-# - fix_deps:
-#   All deps must be contained in the archive unless they are on the UNSATISFIED_DEPS_ALLOW_LIST.
-#   All deps must be named for the actual library that they need to find, not a symlink to it.
-#   All deps from one library inside the archive to another library inside the archive must be specified in the following way:
-#     * On Darwin: @rpath/<name-of-library>
-#     * On Linux: simply <name-of-library>
-#   Deps to libraries not contained in the archive are left unchanged.
 
 
 USAGE = """
@@ -44,6 +53,9 @@ Usage: fix_vendor_libs INPUT_PATH [OUTPUT_PATH]")
 
 SITE_PACKAGES_PREFIX = "env/lib/python3.x/site-packages/"
 
+# The sole directories allowed at the top level of vendor-Darwin.tar.gz
+TOP_LEVEL_DIRECTORIES = ["env", "wheelhouse"]
+
 PLATFORM = platform.system()
 
 if PLATFORM == "Darwin":
@@ -51,25 +63,31 @@ if PLATFORM == "Darwin":
     LOADER_PATH = "@loader_path"
     RPATH_PREFIX = "@rpath/"
     LIB_EXTENSIONS = [".dylib", ".so"]
+    SYSTEM_PREFIXES = ["/usr/lib/"]
 elif PLATFORM == "Linux":
     VENDOR_ARCHIVE_NAME = "vendor-Linux.tar.gz"
     LOADER_PATH = "$ORIGIN"
     RPATH_PREFIX = ""
     LIB_EXTENSIONS = [".so", ".so.*"]
+    SYSTEM_PREFIXES = []
+
+VENDOR_ARCHIVE_CONTENTS = f"{VENDOR_ARCHIVE_NAME}-contents"
 
 
 if PLATFORM == "Darwin":
-    UNSATISFIED_DEPS_ALLOW_LIST = [
-        "libSystem.B.dylib",
-        "libbrotlicommon.1.dylib",
-        "libc++.1.dylib",
-        "libiconv.2.dylib",
-        "libresolv.9.dylib",
-        "libsasl2.2.dylib",
-        "libz.1.dylib",
+    SYSTEM_DEPS_ALLOW_LIST = [
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/libc++.1.dylib",
+        "/usr/lib/libcharset.1.dylib",
+        "/usr/lib/libiconv.2.dylib",
+        "/usr/lib/libncurses.5.4.dylib",
+        "/usr/lib/libpanel.5.4.dylib",
+        "/usr/lib/libresolv.9.dylib",
+        "/usr/lib/libsasl2.2.dylib",
+        "/usr/lib/libz.1.dylib",
     ]
 elif PLATFORM == "Linux":
-    UNSATISFIED_DEPS_ALLOW_LIST = [
+    SYSTEM_DEPS_ALLOW_LIST = [
         "ld-linux-x86-64.so.2",
         "libc.so.6",
         "libcrypto.so.10",
@@ -90,7 +108,7 @@ elif PLATFORM == "Linux":
     ]
 
 
-UNSATISFIED_DEPS_ALLOW_SET = set(UNSATISFIED_DEPS_ALLOW_LIST)
+SYSTEM_DEPS_ALLOW_SET = set(SYSTEM_DEPS_ALLOW_LIST)
 
 
 class PlatformSpecific:
@@ -106,15 +124,14 @@ def checkmark(message):
 
 
 def warn(message, make_fatal=False, detail=None):
-    if detail:
-        message = "\n".join([message, detail])
     if make_fatal:
-        fatal(message)
-    else:
-        print(f"⚠️  {message}", file=sys.stderr)
+        fatal(message, detail)
+    message = "\n".join([message, detail]) if detail else message
+    print(f"⚠️  {message}", file=sys.stderr)
 
 
-def fatal(message):
+def fatal(message, detail=None):
+    message = "\n".join([message, detail]) if detail else message
     print(f"❌  {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -128,26 +145,31 @@ def json_dumps(json_obj, root_path):
     return json.dumps(json_obj, indent=2, default=default)
 
 
-def unpack_all(input_path, work_dir):
-    contents_path = work_dir / f"{VENDOR_ARCHIVE_NAME}-contents"
+def unpack_all(input_path, root_path):
+    contents_path = root_path / VENDOR_ARCHIVE_CONTENTS
+    contents_path.mkdir()
     if input_path.is_file():
         info(f"Extracting {input_path} ...")
-        contents_path.mkdir()
         subprocess.check_call(["tar", "-xzf", input_path, "--directory", contents_path])
     else:
-        info(f"Copying {input_path} ...")
-        shutil.copytree(input_path, contents_path)
+        info(f"Copying from {input_path} ...")
+        for d in TOP_LEVEL_DIRECTORIES:
+            assert (input_path / d).is_dir()
+            shutil.copytree(input_path / d, contents_path / d)
+
+    for d in TOP_LEVEL_DIRECTORIES:
+        assert (contents_path / d).is_dir()
 
     for path_to_wheel in wheel_paths(contents_path):
-        unpack_wheel(path_to_wheel, work_dir)
+        unpack_wheel(path_to_wheel, root_path)
 
 
-def pack_all(work_dir, output_path):
-    for path_to_wheel in wheel_paths(work_dir):
-        pack_wheel(path_to_wheel, work_dir)
+def pack_all(root_path, output_path):
+    for path_to_wheel in wheel_paths(root_path):
+        pack_wheel(path_to_wheel, root_path)
 
     info(f"Writing {output_path} ...")
-    contents_path = work_dir / f"{VENDOR_ARCHIVE_NAME}-contents"
+    contents_path = root_path / VENDOR_ARCHIVE_CONTENTS
     assert contents_path.is_dir()
     subprocess.check_call(
         [
@@ -165,28 +187,28 @@ def wheel_paths(root_path):
     yield from root_path.glob("**/*.whl")
 
 
-def unpack_wheel(path_to_wheel, work_dir):
+def unpack_wheel(path_to_wheel, root_path):
     wheel_name = path_to_wheel.name
 
     info(f"Unpacking {wheel_name} ...")
     subprocess.check_output(
-        [sys.executable, "-m", "wheel", "unpack", "--dest", work_dir, path_to_wheel]
+        [sys.executable, "-m", "wheel", "unpack", "--dest", root_path, path_to_wheel]
     )
 
     parts = wheel_name.split("-")
     wheel_id = f"{parts[0]}-{parts[1]}"
 
-    wheel_contents_path = work_dir / wheel_id
+    wheel_contents_path = root_path / wheel_id
     if not wheel_contents_path.is_dir():
         fatal(f"Unpacking {wheel_name} didn't work as expected")
 
-    wheel_contents_path.rename(work_dir / f"{wheel_name}-contents")
+    wheel_contents_path.rename(root_path / f"{wheel_name}-contents")
 
 
-def pack_wheel(path_to_wheel, work_dir):
+def pack_wheel(path_to_wheel, root_path):
     wheel_name = path_to_wheel.name
     dest_dir = path_to_wheel.parents[0]
-    wheel_contents_path = work_dir / f"{wheel_name}-contents"
+    wheel_contents_path = root_path / f"{wheel_name}-contents"
     assert wheel_contents_path.is_dir()
 
     info(f"Re-packing {wheel_name} ...")
@@ -230,6 +252,24 @@ def remove_lib_ext(lib_name):
     return lib_name
 
 
+def split_lib_ext(lib_name):
+    for ext in LIB_EXTENSIONS:
+        if lib_name.endswith(ext):
+            return lib_name[: -len(ext)], ext
+    return lib_name, ""
+
+
+DOT_PLUS_DIGITS = r"\.[0-9]+"
+VERSION_PATTERN = re.compile("(" + DOT_PLUS_DIGITS + ")*$")
+
+
+def split_lib_version_suffix(lib_name):
+    match = VERSION_PATTERN.search(lib_name)
+    if match:
+        return lib_name[: match.span()[0]], match.group(0)
+    return lib_name, ""
+
+
 UNMODIFIED = 0
 MODIFIED = 1
 
@@ -260,24 +300,12 @@ def set_install_name_Linux(path_to_lib, install_name):
     subprocess.check_call(["patchelf", "--set-soname", install_name, path_to_lib])
 
 
-DOT_PLUS_DIGITS = r"\.[0-9]+"
-VERSION_PATTERN = re.compile("(" + DOT_PLUS_DIGITS + ")*$")
-
-
-def get_proposed_name(path_to_lib, install_name, root_path):
-    return path_to_lib.name
-
-
 def fix_names(root_path, make_fatal=False, verbose=False):
     problems = []
     for path_to_lib in lib_paths(root_path):
         install_name = get_install_name(path_to_lib)
-        proposed_name = get_proposed_name(path_to_lib, install_name, root_path)
-        if not proposed_name:
-            continue
-        if path_to_lib.name != proposed_name or (
-            install_name and install_name != proposed_name
-        ):
+        proposed_name = path_to_lib.name
+        if install_name and install_name != proposed_name:
             problems.append(
                 {
                     "lib": path_to_lib,
@@ -426,36 +454,12 @@ def get_deps_Linux(path_to_lib):
     return read_elf_cmd_lines(path_to_lib, "(NEEDED)")
 
 
-def rpath_dep(dep):
-    return RPATH_PREFIX + Path(dep).name
-
-
-def get_proposed_dep(dep, all_satisfied_deps):
-    # Find an exact match:
-    dep_name = Path(dep).name
-    if dep_name in all_satisfied_deps:
-        return rpath_dep(dep)
-    if dep_name in UNSATISFIED_DEPS_ALLOW_SET:
-        return dep
-
-    # Search for similar looking deps:
-    n1 = remove_lib_ext(dep_name)
-    for satisfied_dep in all_satisfied_deps:
-        n2 = remove_lib_ext(satisfied_dep)
-        if n1.startswith(n2) or n2.startswith(n1):
-            return rpath_dep(satisfied_dep)
-
-    return None
-
-
-def list_unsatisfied_deps(satisfied_deps, unsatisfied_deps):
+def sorted_good_and_bad_deps(good_deps, bad_deps):
     output = []
-    for dep in sorted(
-        unsatisfied_deps | satisfied_deps, key=lambda dep: Path(dep).name
-    ):
-        prefix = "🆗  " if dep in satisfied_deps else "❌  "
+    for dep in sorted(good_deps | bad_deps, key=lambda dep: Path(dep).name):
+        prefix = "🆗  " if dep in good_deps else "❌  "
         output.append(prefix + dep)
-    return "Unsatisfied dependencies:\n" + "\n".join(output)
+    return "\n".join(output)
 
 
 change_dep = PlatformSpecific()
@@ -473,64 +477,203 @@ def change_dep_Linux(path_to_lib, old_dep, new_dep):
     )
 
 
-def fix_deps(root_path, make_fatal=False, verbose=False):
-    all_satisfied_deps = set()
-    for path_to_lib in lib_paths(root_path):
-        all_satisfied_deps.add(path_to_lib.name)
+def debug_name_variants(dep):
+    # TODO - this is probably a hack for which there is proper solution.
+    base_name, ext = split_lib_ext(Path(dep).name)
+    base_name, version_suffix = split_lib_version_suffix(base_name)
+    yield base_name + version_suffix + ext
 
-    fatal_problems = []
-    fixable_problems = []
-
-    all_unsatisfied_deps = set()
-
-    for path_to_lib in lib_paths(root_path):
-        unsatisfied_deps = []
-        deps_to_change = []
-
-        deps = get_deps(path_to_lib)
-        for dep in deps:
-            if dep == get_install_name(path_to_lib):
-                continue
-            proposed_dep = get_proposed_dep(dep, all_satisfied_deps)
-            if not proposed_dep:
-                unsatisfied_deps.append(dep)
-            elif dep != proposed_dep:
-                deps_to_change.append([dep, proposed_dep])
-
-        if unsatisfied_deps:
-            fatal_problems.append(
-                {"lib": path_to_lib, "deps": deps, "unsatisfied_deps": unsatisfied_deps}
-            )
-            all_unsatisfied_deps.update(unsatisfied_deps)
-        if deps_to_change:
-            fixable_problems.append(
-                {"lib": path_to_lib, "deps": deps, "deps_to_change": deps_to_change}
-            )
-
-    if fatal_problems:
-        detail = json_dumps(fatal_problems, root_path)
-        detail += "\n" + list_unsatisfied_deps(all_satisfied_deps, all_unsatisfied_deps)
-        fatal(
-            f"Checking deps: found {len(fatal_problems)} libs with unsatisfied_deps.\n{detail}"
-        )
+    if base_name.endswith("-d"):
+        base_name = base_name[:-2]
+    elif base_name.endswith("d"):
+        base_name = base_name[:-1]
     else:
-        checkmark("Checking deps: all deps are satisfied or allowed.")
+        base_name += "d"
+    yield base_name + version_suffix + ext
 
-    if not fixable_problems:
-        checkmark("Checking deps: all lib deps are well formatted.")
+
+def get_pattern_for_dep(dep):
+    base_name, ext = split_lib_ext(Path(dep).name)
+    base_name, version_suffix = split_lib_version_suffix(base_name)
+    return base_name + ext, base_name + ".*" + ext
+
+
+def lib_names_match(dep1, dep2):
+    base1, ext1 = split_lib_ext(Path(dep1).name)
+    base2, ext2 = split_lib_ext(Path(dep1).name)
+    return ext1 == ext2 and base1.startswith(base2) or base2.startswith(base1)
+
+
+class FindDepResult(Enum):
+    VENDOR_DEP_FOUND = "vendor dep found"
+    VENDOR_DEP_NOT_FOUND = "vendor dep not found"
+    ALLOWED_SYSTEM_DEP = "allowed system dep"
+    UNEXPECTED_SYSTEM_DEP = "unexpected system dep"
+
+
+VENDOR_DEP_FOUND = FindDepResult.VENDOR_DEP_FOUND
+VENDOR_DEP_NOT_FOUND = FindDepResult.VENDOR_DEP_NOT_FOUND
+ALLOWED_SYSTEM_DEP = FindDepResult.ALLOWED_SYSTEM_DEP
+UNEXPECTED_SYSTEM_DEP = FindDepResult.UNEXPECTED_SYSTEM_DEP
+
+
+def resolve_lib_in_folder(folder, lib_name):
+    if lib_name is None:
+        return None
+    unresolved = folder / Path(lib_name).name
+    if not unresolved.is_file():
+        return None
+    if unresolved.is_symlink():
+        symlinked_to_name = unresolved.resolve()
+        return resolve_lib_in_folder(folder, symlinked_to_name)
+    else:
+        return unresolved
+
+
+def find_dep(dep_str, search_paths):
+    if dep_str in SYSTEM_DEPS_ALLOW_SET:
+        return ALLOWED_SYSTEM_DEP, None
+
+    for system_prefix in SYSTEM_PREFIXES:
+        if dep_str.startswith(system_prefix):
+            return UNEXPECTED_SYSTEM_DEP, None
+
+    dep_path = Path(dep_str)
+    if dep_path.is_absolute() and dep_path.is_file():
+        return VENDOR_DEP_FOUND, dep_path.resolve()
+
+    for dep_name in debug_name_variants(dep_path.name):
+        for search_path in search_paths:
+            dep_path = resolve_lib_in_folder(search_path, dep_name)
+            if dep_path:
+                return VENDOR_DEP_FOUND, dep_path
+
+        dep_name_base, dep_name_pattern = get_pattern_for_dep(dep_name)
+        for search_path in search_paths:
+            dep_path = resolve_lib_in_folder(search_path, dep_name_base)
+            if not dep_path:
+                dep_path = resolve_lib_in_folder(
+                    search_path, next(iter(search_path.glob(dep_name_pattern)), None)
+                )
+            if dep_path and lib_names_match(dep_str, dep_path):
+                return VENDOR_DEP_FOUND, dep_path
+
+    return VENDOR_DEP_NOT_FOUND, None
+
+
+def fix_unsatisfied_deps(root_path, make_fatal=False, verbose=False):
+    env_lib_path = root_path / VENDOR_ARCHIVE_CONTENTS / "env" / "lib"
+
+    lib_paths_list = list(lib_paths(root_path))
+
+    deps_by_result = {key: set() for key in FindDepResult}
+    vendor_deps_found_outside = []
+
+    for path_to_lib in lib_paths_list:
+        install_name = get_install_name(path_to_lib)
+        search_paths = [
+            env_lib_path,
+            path_to_lib.parents[0],
+            *[Path(rpath) for rpath in get_rpaths(path_to_lib)],
+        ]
+
+        for dep in get_deps(path_to_lib):
+            if dep == install_name:
+                continue
+            result, found_path = find_dep(dep, search_paths)
+            if found_path and found_path not in lib_paths_list:
+                lib_paths_list.append(found_path)
+                vendor_deps_found_outside.append(found_path)
+
+    if deps_by_result[UNEXPECTED_SYSTEM_DEP]:
+        detail = sorted_good_and_bad_deps(
+            deps_by_result[ALLOWED_SYSTEM_DEP],
+            deps_by_result[UNEXPECTED_SYSTEM_DEP],
+        )
+        count = len(deps_by_result[ALLOWED_SYSTEM_DEP])
+        fatal(
+            f"Checking deps: Found {count} system deps that have not been explicitly allowed.",
+            detail=detail,
+        )
+
+    if deps_by_result[VENDOR_DEP_NOT_FOUND]:
+        detail = sorted_good_and_bad_deps(
+            set(Path(lib).name for lib in lib_paths_list),
+            deps_by_result[VENDOR_DEP_NOT_FOUND],
+        )
+        count = len(deps_by_result[VENDOR_DEP_NOT_FOUND])
+        fatal(
+            f"Checking deps: Found {count} vendor deps where the library to satisfy the dep could not be found.",
+            detail=detail,
+        )
+
+    if not vendor_deps_found_outside:
+        checkmark(
+            "Checking deps: all vendor deps are satisfied with libraries inside the vendor archive."
+        )
         return UNMODIFIED
 
-    detail = json_dumps(fixable_problems, root_path) if verbose else None
+    count = len(vendor_deps_found_outside)
+    detail = "\n".join(str(p) for p in vendor_deps_found_outside) if verbose else None
     warn(
-        f"Checking deps: found {len(fixable_problems)} libs with dep formatting issues.",
+        f"Checking deps: found {count} deps satisfied with a library outside the vendor archive.",
+        make_fatal=make_fatal,
+        detail=detail,
+    )
+    for src_path in vendor_deps_found_outside:
+        dest_path = env_lib_path / src_path.name
+        if not dest_path.exists():
+            shutil.copy(src_path, dest_path)
+
+    return MODIFIED
+
+
+def fix_dep_linkage(root_path, make_fatal=False, verbose=False):
+    env_lib_path = root_path / VENDOR_ARCHIVE_CONTENTS / "env" / "lib"
+
+    problems = []
+    for path_to_lib in lib_paths(root_path):
+        install_name = get_install_name(path_to_lib)
+        search_paths = [
+            env_lib_path,
+            path_to_lib.parents[0],
+        ]
+        deps_to_change = []
+
+        for dep in get_deps(path_to_lib):
+            if dep == install_name:
+                continue
+            result, found_path = find_dep(dep, search_paths)
+            if result != VENDOR_DEP_FOUND:
+                continue
+
+            proposed_dep = RPATH_PREFIX + found_path.name
+            if dep != proposed_dep:
+                deps_to_change.append([dep, proposed_dep])
+
+        if deps_to_change:
+            problems.append(
+                {
+                    "lib": path_to_lib,
+                    "deps_to_change": deps_to_change,
+                }
+            )
+
+    if not problems:
+        checkmark("Checking dep linkage: all vendor deps are properly linked.")
+        return UNMODIFIED
+
+    detail = json_dumps(problems, root_path) if verbose else None
+    warn(
+        f"Checking dep linkage: found {len(problems)} libs with linkage issues.",
         make_fatal=make_fatal,
         detail=detail,
     )
 
-    for problem in fixable_problems:
+    for problem in problems:
         path_to_lib = problem["lib"]
-        for old_dep, new_dep in problem["deps_to_change"]:
-            change_dep(path_to_lib, old_dep, new_dep)
+        for dep, proposed_dep in problem["deps_to_change"]:
+            change_dep(path_to_lib, dep, proposed_dep)
 
     return MODIFIED
 
@@ -547,27 +690,29 @@ def fix_everything(input_path, output_path):
     else:
         print("(Running in dry-run mode since no OUTPUT_PATH was supplied.)")
 
-    with tempfile.TemporaryDirectory() as work_dir:
-        work_dir = Path(work_dir)
-        unpack_all(input_path, work_dir)
+    with tempfile.TemporaryDirectory() as root_path:
+        root_path = Path(root_path)
+        unpack_all(input_path, root_path)
 
         status = UNMODIFIED
-        status |= fix_names(work_dir)
-        status |= fix_rpaths(work_dir)
-        status |= fix_deps(work_dir)
+        status |= fix_unsatisfied_deps(root_path)
+        status |= fix_dep_linkage(root_path)
+        status |= fix_names(root_path)
+        status |= fix_rpaths(root_path)
 
         if status == MODIFIED:
             checkmark("Finished fixing.\n")
             info("Checking everything was fixed ...")
             kwargs = {"make_fatal": True, "verbose": True}
-            fix_names(work_dir, **kwargs)
-            fix_rpaths(work_dir, **kwargs)
-            fix_deps(work_dir, **kwargs)
+            fix_unsatisfied_deps(root_path, **kwargs)
+            fix_dep_linkage(root_path, **kwargs)
+            fix_names(root_path, **kwargs)
+            fix_rpaths(root_path, **kwargs)
         else:
             checkmark("Nothing to change.\n")
 
         if output_path:
-            pack_all(work_dir, output_path)
+            pack_all(root_path, output_path)
             checkmark(f"Wrote fixed archive to {output_path}")
         elif status == MODIFIED:
             warn("Archive was fixed, but not writing anywhere due to dry-run mode.")
