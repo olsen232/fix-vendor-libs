@@ -149,13 +149,13 @@ def unpack_all(input_path, root_path):
     contents_path = root_path / VENDOR_ARCHIVE_CONTENTS
     contents_path.mkdir()
     if input_path.is_file():
-        info(f"Extracting {input_path} ...")
+        info(f"Extracting {input_path} to {root_path} ...")
         subprocess.check_call(["tar", "-xzf", input_path, "--directory", contents_path])
     else:
-        info(f"Copying from {input_path} ...")
+        info(f"Copying from {input_path} to {root_path} ...")
         for d in TOP_LEVEL_DIRECTORIES:
             assert (input_path / d).is_dir()
-            shutil.copytree(input_path / d, contents_path / d)
+            shutil.copytree(input_path / d, contents_path / d, symlinks=True)
 
     for d in TOP_LEVEL_DIRECTORIES:
         assert (contents_path / d).is_dir()
@@ -477,21 +477,6 @@ def change_dep_Linux(path_to_lib, old_dep, new_dep):
     )
 
 
-def debug_name_variants(dep):
-    # TODO - this is probably a hack for which there is proper solution.
-    base_name, ext = split_lib_ext(Path(dep).name)
-    base_name, version_suffix = split_lib_version_suffix(base_name)
-    yield base_name + version_suffix + ext
-
-    if base_name.endswith("-d"):
-        base_name = base_name[:-2]
-    elif base_name.endswith("d"):
-        base_name = base_name[:-1]
-    else:
-        base_name += "d"
-    yield base_name + version_suffix + ext
-
-
 def get_pattern_for_dep(dep):
     base_name, ext = split_lib_ext(Path(dep).name)
     base_name, version_suffix = split_lib_version_suffix(base_name)
@@ -542,21 +527,21 @@ def find_dep(dep_str, search_paths):
     if dep_path.is_absolute() and dep_path.is_file():
         return VENDOR_DEP_FOUND, dep_path.resolve()
 
-    for dep_name in debug_name_variants(dep_path.name):
-        for search_path in search_paths:
-            dep_path = resolve_lib_in_folder(search_path, dep_name)
-            if dep_path:
-                return VENDOR_DEP_FOUND, dep_path
+    dep_name = dep_path.name
+    for search_path in search_paths:
+        dep_path = resolve_lib_in_folder(search_path, dep_name)
+        if dep_path:
+            return VENDOR_DEP_FOUND, dep_path
 
-        dep_name_base, dep_name_pattern = get_pattern_for_dep(dep_name)
-        for search_path in search_paths:
-            dep_path = resolve_lib_in_folder(search_path, dep_name_base)
-            if not dep_path:
-                dep_path = resolve_lib_in_folder(
-                    search_path, next(iter(search_path.glob(dep_name_pattern)), None)
-                )
-            if dep_path and lib_names_match(dep_str, dep_path):
-                return VENDOR_DEP_FOUND, dep_path
+    dep_name_base, dep_name_pattern = get_pattern_for_dep(dep_name)
+    for search_path in search_paths:
+        dep_path = resolve_lib_in_folder(search_path, dep_name_base)
+        if not dep_path:
+            dep_path = resolve_lib_in_folder(
+                search_path, next(iter(search_path.glob(dep_name_pattern)), None)
+            )
+        if dep_path and lib_names_match(dep_str, dep_path):
+            return VENDOR_DEP_FOUND, dep_path
 
     return VENDOR_DEP_NOT_FOUND, None
 
